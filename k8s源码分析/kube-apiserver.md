@@ -124,7 +124,44 @@ For given pod:
 ```
 kube-scheduler 目前包含两部分调度算法 predicates 和 priorities，首先执行 predicates 算法过滤部分 node 然后执行 priorities 算法为所有 node 打分，最后从所有 node 中选出分数最高的最为最佳的 node。
 
-# kube-proxy 
+# kube-proxy
+kube-proxy是Kubernetes的核心组件，部署在每个Node节点上，它是实现Kubernetes Service的通信与负载均衡机制的重要组件; kube-proxy负责为Pod创建代理服务，从apiserver获取所有server信息，并根据server信息创建代理服务，实现server到Pod的请求路由和转发，从而实现K8s层级的虚拟转发网络。
+
+简单来说: 
++ kube-proxy其实就是管理service的访问入口，包括集群内Pod到Service的访问和集群外访问service。
++ kube-proxy管理sevice的Endpoints，该service对外暴露一个Virtual IP，也成为Cluster IP, 集群内通过访问这个Cluster IP:Port就能访问到集群内对应的serivce下的Pod。
++ service是通过Selector选择的一组Pods的服务抽象，其实就是一个微服务，提供了服务的LB和反向代理的能力，而kube-proxy的主要作用就是负责service的实现。
++ service另外一个重要作用是，一个服务后端的Pods可能会随着生存灭亡而发生IP的改变，service的出现，给服务提供了一个固定的IP，而无视后端Endpoint的变化。
+
+## kube-proxy 工作原理
++ userspace mode
+  userspace是在用户空间，通过kube-proxy来实现service的代理服务,  其原理如下
+  ![image](https://img2018.cnblogs.com/blog/907596/201906/907596-20190628144448994-121687144.png)
+
+  可见，userspace这种mode最大的问题是，service的请求会先从用户空间进入内核iptables，然后再回到用户空间，由kube-proxy完成后端Endpoints的选择和代理工作，这样流量从用户空间进出内核带来的性能损耗是不可接受的。这也是k8s v1.0及之前版本中对kube-proxy质疑最大的一点，因此社区就开始研究iptables mode.
+
+  userspace这种模式下，kube-proxy 持续监听 Service 以及 Endpoints 对象的变化；对每个 Service，它都为其在本地节点开放一个端口，作为其服务代理端口；发往该端口的请求会采用一定的策略转发给与该服务对应的后端 Pod 实体。kube-proxy 同时会在本地节点设置 iptables 规则，配置一个 Virtual IP，把发往 Virtual IP 的请求重定向到与该 Virtual IP 对应的服务代理端口上。其工作流程大体如下:
+  ![image](https://img2018.cnblogs.com/blog/907596/201903/907596-20190325170529464-807275929.png)
+
++ iptables mode
+  该模式完全利用内核iptables来实现service的代理和LB, 这是K8s在v1.2及之后版本默认模式. 工作原理如下:
+  ![img](https://img2018.cnblogs.com/blog/907596/201906/907596-20190628150040159-782250464.png)
+
+  iptables mode因为使用iptable NAT来完成转发，也存在不可忽视的性能损耗。另外，如果集群中存在上万的Service/Endpoint，那么Node上的iptables rules将会非常庞大，性能还会再打折扣。这也导致目前大部分企业用k8s上生产时，都不会直接用kube-proxy作为服务代理，而是通过自己开发或者通过Ingress Controller来集成HAProxy, Nginx来代替kube-proxy。
+
+  iptables 模式与 userspace 相同，kube-proxy 持续监听 Service 以及 Endpoints 对象的变化；但它并不在本地节点开启反向代理服务，而是把反向代理全部交给 iptables 来实现；即 iptables 直接将对 VIP 的请求转发给后端 Pod，通过 iptables 设置转发策略。其工作流程大体如下:
+
+  ![image](https://img2018.cnblogs.com/blog/907596/201903/907596-20190325170538450-107344229.png)
+
+   该模式相比 userspace 模式，克服了请求在用户态-内核态反复传递的问题，性能上有所提升，但使用 iptables NAT 来完成转发，存在不可忽视的性能损耗，而且在大规模场景下，iptables 规则的条目会十分巨大，性能上还要再打折扣。
++  ipvs mode
+  在kubernetes 1.8以上的版本中，对于kube-proxy组件增加了除iptables模式和用户模式之外还支持ipvs模式。kube-proxy ipvs 是基于 NAT 实现的，通过ipvs的NAT模式，对访问k8s service的请求进行虚IP到POD IP的转发。当创建一个 service 后，kubernetes 会在每个节点上创建一个网卡，同时帮你将 Service IP(VIP) 绑定上，此时相当于每个 Node 都是一个 ds，而其他任何 Node 上的 Pod，甚至是宿主机服务(比如 kube-apiserver 的 6443)都可能成为 rs；
+
+  与iptables、userspace 模式一样，kube-proxy 依然监听Service以及Endpoints对象的变化, 不过它并不创建反向代理, 也不创建大量的 iptables 规则, 而是通过netlink 创建ipvs规则，并使用k8s Service与Endpoints信息，对所在节点的ipvs规则进行定期同步; netlink 与 iptables 底层都是基于 netfilter 钩子，但是 netlink 由于采用了 hash table 而且直接工作在内核态，在性能上比 iptables 更优。其工作流程大体如下:
+  
+  ![img](https://img2018.cnblogs.com/blog/907596/201903/907596-20190325170554554-1168234966.png)
+
+
 
 # kubelet
 kubelet 是运行在每个节点上的主要的“节点代理”，每个节点都会启动 kubelet进程，用来处理 Master 节点下发到本节点的任务，按照 PodSpec 描述来管理Pod 和其中的容器（PodSpec 是用来描述一个 pod 的 YAML 或者 JSON 对象）。
@@ -210,20 +247,112 @@ service 支持的类型也就是 kubernetes 中服务暴露的方式，默认有
 
   ![image](https://pic2.zhimg.com/80/v2-dde4bfdfdb4dde7c51a9adab3462ee65_720w.jpg)
 
+  ClusterIP 服务的 YAML 文件类似如下：
+  ```
+  apiVersion: v1
+  kind: Service
+  metadata:  
+  name: my-internal-service
+  selector:    
+  app: my-app
+  spec:
+  type: ClusterIP
+  ports:  
+  - name: http
+  port: 80
+  targetPort: 80
+  protocol: TCP
+  ```
+  启动 Kubernetes proxy 模式：
+  > $ kubectl proxy --port=8080
+
+  这样你可以通过Kubernetes API，使用如下模式来访问这个服务：
+  > http://localhost:8080/api/v1/proxy/namespaces/<NAMESPACE>/services/<SERVICE-NAME>:<PORT-NAME>/
+
+  何时使用这种方式？
+  有一些场景下，你得使用 Kubernetes 的 proxy 模式来访问你的服务：
+  + 由于某些原因，你需要调试你的服务，或者需要直接通过笔记本电脑去访问它们。
+  + 容许内部通信，展示内部仪表盘等。
+
 + NodePort
     如果你想要在集群外访问集群内部的服务，可以使用这种类型的 service，NodePort 类型的 service 会在集群内部署了 kube-proxy 的节点打开一个指定的端口，之后所有的流量直接发送到这个端口，然后会被转发到 service 后端真实的服务进行访问。Nodeport 构建在 ClusterIP 上，其访问链路如下所示：
     > client ---> NodeIP:NodePort ---> ClusterIP:ServicePort ---> (iptables)DNAT ---> PodIP:containePort
 
     ![image](https://pic4.zhimg.com/80/v2-dad0467f3b09007f746ad02e4dbfbb7f_720w.jpg)
 
+  NodePort 服务的 YAML 文件类似如下：
+  ```
+  apiVersion: v1
+  kind: Service
+  metadata:  
+  name: my-nodeport-service
+  selector:    
+  app: my-app
+  spec:
+  type: NodePort
+  ports:  
+  - name: http
+  port: 80
+  targetPort: 80
+  nodePort: 30036
+  protocol: TCP
+  ```
+  NodePort 服务主要有两点区别于普通的“ClusterIP”服务。第一，它的类型是“NodePort”。有一个额外的端口，称为 nodePort，它指定节点上开放的端口值 。如果你不指定这个端口，系统将选择一个随机端口。大多数时候我们应该让 Kubernetes 来选择端口，因为如评论中 thockin 所说，用户自己来选择可用端口代价太大。
+
+  何时使用这种方式？
+  这种方法有许多缺点：
+  + 每个端口只能是一种服务
+  + 端口范围只能是 30000-32767
+  + 如果节点/VM 的 IP 地址发生变化，你需要能处理这种情况。
+  
+  基于以上原因，我不建议在生产环境上用这种方式暴露服务。如果你运行的服务不要求一直可用，或者对成本比较敏感，你可以使用这种方法。这样的应用的最佳例子是 demo 应用，或者某些临时应用。
+
 + LoadBalancer
   LoadBalancer 类型的 service 通常和云厂商的 LB 结合一起使用，用于将集群内部的服务暴露到外网，云厂商的 LoadBalancer 会给用户分配一个 IP，之后通过该 IP 的流量会转发到你的 service 上。
   ![image](https://pic3.zhimg.com/80/v2-26c98a3e8cb1b9120815fef3a458de76_720w.jpg)
 
+  何时使用这种方式？
+  如果你想要直接暴露服务，这就是默认方式。所有通往你指定的端口的流量都会被转发到对应的服务。它没有过滤条件，没有路由等。这意味着你几乎可以发送任何种类的流量到该服务，像 HTTP，TCP，UDP，Websocket，gRPC 或其它任意种类。
+
+  这个方式的最大缺点是每一个用 LoadBalancer 暴露的服务都会有它自己的 IP 地址，每个用到的 LoadBalancer 都需要付费，这将是非常昂贵的。
+
 + Ingress
   Ingress 其实不是 service 的一个类型，但是它可以作用于多个 service，被称为 service 的 service，作为集群内部服务的入口，Ingress 作用在七层，可以根据不同的 url，将请求转发到不同的 service 上。
 
+  你可以用 Ingress 来做许多不同的事情，各种不同类型的 Ingress 控制器也有不同的能力。
+
+  GKE 上的默认 ingress 控制器是启动一个 HTTP(S) Load Balancer。它允许你基于路径或者子域名来路由流量到后端服务。例如，你可以将任何发往域名 foo.yourdomain.com 的流量转到 foo 服务，将路径 yourdomain.com/bar/path 的流量转到 bar 服务。
+
   ![image](https://pic3.zhimg.com/80/v2-084e94b5fdb225e8c9e19139d04ed8fe_720w.jpg)
+
+  ```
+  apiVersion: extensions/v1beta1
+  kind: Ingress
+  metadata:
+  name: my-ingress
+  spec:
+  backend:
+  serviceName: other
+  servicePort: 8080
+  rules:
+  - host: foo.mydomain.com
+  http:
+    paths:
+    - backend:
+        serviceName: foo
+        servicePort: 8080
+  - host: mydomain.com
+  http:
+    paths:
+    - path: /bar/*
+      backend:
+        serviceName: bar
+        servicePort: 8080
+  ```
+  何时使用这种方式？
+  Ingress 可能是暴露服务的最强大方式，但同时也是最复杂的。Ingress 控制器有各种类型，包括 Google Cloud Load Balancer， Nginx，Contour，Istio，等等。它还有各种插件，比如 cert-manager，它可以为你的服务自动提供 SSL 证书。
+
+  如果你想要使用同一个 IP 暴露多个服务，这些服务都是使用相同的七层协议（典型如 HTTP），那么Ingress 就是最有用的。如果你使用本地的 GCP 集成，你只需要为一个负载均衡器付费，且由于 Ingress是“智能”的，你还可以获取各种开箱即用的特性（比如 SSL，认证，路由，等等）。
 
 + ExternelName
   通过 CNAME 将 service 与 externalName 的值(比如：http://foo.bar.example.com)映射起来，这种方式用的比较少。
