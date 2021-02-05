@@ -538,6 +538,7 @@ __注意__: 因为我的golang 版本是源码编译的, 所以需要增加 --sk
 > make 
 
 常见问题:
+__kubernetes 删除namespace 后一直处于Terminating状态__
 https://blog.csdn.net/ANXIN997483092/article/details/104233494
 
 
