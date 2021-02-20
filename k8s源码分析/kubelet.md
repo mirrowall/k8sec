@@ -14,3 +14,4 @@ main.main (cmd/kubelet/kubelet.go)
         -> RunKubelet
             -> createAndInitKubelet (pkg/kubelet/kubelet.go)
             -> startKubelet
+                -> Run ()
